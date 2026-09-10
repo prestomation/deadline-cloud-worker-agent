@@ -1084,6 +1084,8 @@ class TestSessionActionUpdatedImpl:
             completed_status="FAILED",
             end_time=action_complete_time,
             manifests=None,
+            session_id=session.id,
+            kind=current_action.definition.action_log_kind.value,
         )
 
         # WHEN
@@ -1152,6 +1154,8 @@ class TestSessionActionUpdatedImpl:
             completed_status="FAILED",
             end_time=action_complete_time,
             manifests=None,
+            session_id=session.id,
+            kind=current_action.definition.action_log_kind.value,
         )
 
         # WHEN
@@ -1960,6 +1964,8 @@ class TestSessionCleanup:
                 start_time=current_action.start_time,
                 end_time=action_complete_time,
                 id=current_action.definition.id,
+                session_id=session.id,
+                kind=current_action.definition.action_log_kind.value,
                 status=ActionStatus(
                     state=ActionState.CANCELED,
                     fail_message=stop_fail_message,
@@ -2111,6 +2117,8 @@ class TestSessionStartAction:
                 start_time=now,
                 end_time=now,
                 id=run_step_task_action.id,
+                session_id=session.id,
+                kind=run_step_task_action.action_log_kind.value,
                 status=ActionStatus(
                     state=ActionState.FAILED,
                     fail_message=exception_msg,

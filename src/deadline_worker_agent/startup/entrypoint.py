@@ -39,7 +39,10 @@ from ..log_messages import (
 )
 from ..log_sync.cloudwatch import stream_cloudwatch_logs
 from ..log_sync.loggers import ROOT_LOGGER, logger as log_sync_logger
+from .. import worker_protocol_trace
+from .._version import __version__
 from ..worker import Worker
+from ..worker_protocol_trace import TraceEvent
 from .bootstrap import WorkerBootstrap, bootstrap_worker
 from .host_configuration_script import HostConfigurationScriptRunner
 
@@ -62,6 +65,16 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
         An optional sequence of command-line arguments to be parsed and applied to the
         worker agent configuration
     """
+    # Initialize the protocol trace from the environment. This also removes
+    # the trace environment variables from this process's environment so that
+    # they are never inherited by any child process (including session action
+    # subprocesses).
+    worker_protocol_trace.initialize_from_environment()
+    worker_protocol_trace.emit(
+        TraceEvent.PROCESS_START,
+        agent_version=__version__,
+        platform=sys.platform,
+    )
     try:
         # Load Worker Agent config
         config = Configuration.load(cli_args=cli_args)
@@ -225,6 +238,8 @@ def entrypoint(cli_args: Optional[list[str]] = None, *, stop: Optional[Event] = 
             sys.exit(1)
     finally:
         _logger.info("🚪 Worker Agent exiting")
+        worker_protocol_trace.emit(TraceEvent.PROCESS_STOP)
+        worker_protocol_trace.shutdown_trace()
 
 
 def _agent_shutdown(

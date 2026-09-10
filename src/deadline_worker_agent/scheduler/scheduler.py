@@ -63,6 +63,8 @@ from ..aws.deadline import (
 )
 from ..config import JobsRunAsUserOverride
 from ..utils import MappingWithCallbacks
+from .. import worker_protocol_trace
+from ..worker_protocol_trace import TraceEvent, scrub_protocol_trace_env_vars
 from ..file_system_operations import FileSystemPermissionEnum, make_directory, touch_file
 from ..log_messages import (
     AwsCredentialsLogEvent,
@@ -252,6 +254,10 @@ class WorkerScheduler:
         self._action_completes = []
         self._action_updates_map = {}
         self._action_update_lock = RLock()
+        # Session action IDs already announced by the protocol trace as newly
+        # assigned. Only populated while the (opt-in) protocol trace is
+        # enabled; see _trace_new_assignments().
+        self._trace_seen_assigned_action_ids: set[str] = set()
         self._job_run_as_user_override = job_run_as_user_override
         self._shutdown_grace = None
         self._boto_session = boto_session
@@ -353,6 +359,7 @@ class WorkerScheduler:
         # Note:
         #   When we're doing a worker-initiated drain we will have self._shutdown set. We may, optionally,
         #  have a value for self._shutdown_grace as well.
+        worker_protocol_trace.emit(TraceEvent.DRAIN_START, session_count=len(self._sessions))
         logger.info("Draining any remaining Sessions.")
         if self._sessions:
             logger.info("Shutting down %d Sessions", len(self._sessions))
@@ -417,6 +424,8 @@ class WorkerScheduler:
             except ServiceShutdown:
                 pass
 
+        worker_protocol_trace.emit(TraceEvent.DRAIN_COMPLETE)
+
     def _shutdown_sessions(
         self, gracetime: Optional[timedelta], fail_message: Optional[str]
     ) -> list[Future[None]]:
@@ -447,6 +456,33 @@ class WorkerScheduler:
         #    1.1. finished/in-progress action results
         updated_actions, commit_completed_actions = self._updated_session_actions()
 
+        worker_protocol_trace.emit(
+            TraceEvent.SYNC_START,
+            updated_action_count=len(updated_actions),
+            interruptable=interruptable,
+        )
+        if worker_protocol_trace.get_trace().enabled and updated_actions:
+            # Map each reported action back to its session for the trace. The
+            # snapshot is taken under the same lock the updates were read
+            # under; entries present in updated_actions cannot be removed
+            # until this thread later commits them.
+            with self._action_update_lock:
+                report_session_ids = {
+                    action_id: status.session_id
+                    for action_id, status in self._action_updates_map.items()
+                }
+            for action_id, updated_action_info in updated_actions.items():
+                worker_protocol_trace.emit(
+                    TraceEvent.ACTION_REPORT,
+                    corr=action_id,
+                    status=updated_action_info.get("completedStatus"),
+                    progress=updated_action_info.get("progressPercent"),
+                    session_id=report_session_ids.get(action_id),
+                    has_timestamps=(
+                        "startedAt" in updated_action_info or "endedAt" in updated_action_info
+                    ),
+                )
+
         #    1.2. TODO: IP address changes
 
         # 2. make request
@@ -469,6 +505,27 @@ class WorkerScheduler:
         response = update_worker_schedule(**request)
 
         commit_completed_actions()
+
+        # Note: assignedSessions/cancelSessionActions are expected in the
+        # response, but the payload computation here must never be able to
+        # raise ahead of the code below that validates/uses the response.
+        assigned_sessions_in_response = response.get("assignedSessions")
+        cancel_session_actions_in_response = response.get("cancelSessionActions")
+        worker_protocol_trace.emit(
+            TraceEvent.SYNC_COMPLETE,
+            assigned_session_count=(
+                len(assigned_sessions_in_response)
+                if assigned_sessions_in_response is not None
+                else None
+            ),
+            cancel_session_count=(
+                len(cancel_session_actions_in_response)
+                if cancel_session_actions_in_response is not None
+                else None
+            ),
+            update_interval_seconds=response.get("updateIntervalSeconds"),
+            desired_status=response.get("desiredWorkerStatus"),
+        )
 
         # 3. take action based on response
         #    3.1. create new sessions
@@ -638,6 +695,7 @@ class WorkerScheduler:
     ) -> None:
         assigned_sessions = response["assignedSessions"]
         canceled_session_action = response["cancelSessionActions"]
+        self._trace_new_assignments(assigned_sessions=assigned_sessions)
         self._remove_finished_sessions(assigned_sessions=assigned_sessions)
         self._cleanup_queue_aws_credentials(assigned_sessions=assigned_sessions)
         created_session_ids = self._create_new_sessions(assigned_sessions=assigned_sessions)
@@ -650,6 +708,37 @@ class WorkerScheduler:
             assigned_sessions=existing_sessions, canceled_session_action=canceled_session_action
         )
         self._update_session_logging(assigned_sessions=existing_sessions)
+
+    def _trace_new_assignments(
+        self,
+        *,
+        assigned_sessions: dict[str, AssignedSession],
+    ) -> None:
+        """Emits one protocol trace record for every session action observed
+        for the FIRST time in an UpdateWorkerSchedule response.
+
+        The service repeats a session's current action list across responses,
+        so a per-process set of already-seen action IDs de-duplicates the
+        records: each action is announced as newly assigned exactly once per
+        agent process. No-op (and no set growth) when the protocol trace is
+        disabled; the trace is an opt-in diagnostic.
+        """
+        if not worker_protocol_trace.get_trace().enabled:
+            return
+        for session_id, assigned_session in assigned_sessions.items():
+            for action in assigned_session["sessionActions"]:
+                action_id = action["sessionActionId"]
+                if action_id in self._trace_seen_assigned_action_ids:
+                    continue
+                self._trace_seen_assigned_action_ids.add(action_id)
+                worker_protocol_trace.emit(
+                    TraceEvent.ACTION_ASSIGNED,
+                    corr=action_id,
+                    session_id=session_id,
+                    kind=action.get("actionType"),
+                    env_id=cast(Optional[str], action.get("environmentId")),
+                    worker_id=self._worker_id,
+                )
 
     def _remove_finished_sessions(
         self,
@@ -671,6 +760,12 @@ class WorkerScheduler:
             #   it has no SessionActions in it.
             ses.session.wait()
             del self._sessions[removed_session_id]
+            worker_protocol_trace.emit(
+                TraceEvent.SESSION_COMPLETE,
+                corr=removed_session_id,
+                queue_id=ses.session._queue_id,
+                job_id=ses.session._job_id,
+            )
             logger.info(
                 SessionLogEvent(
                     subtype=SessionLogEventSubtype.COMPLETE,
@@ -685,6 +780,14 @@ class WorkerScheduler:
         self,
         action_status: SessionActionStatus,
     ) -> None:
+        if action_status.completed_status is not None:
+            worker_protocol_trace.emit(
+                TraceEvent.ACTION_COMPLETE,
+                corr=action_status.id,
+                status=action_status.completed_status,
+                session_id=action_status.session_id,
+                kind=action_status.kind,
+            )
         with self._action_update_lock:
             self._action_updates_map[action_status.id] = action_status
 
@@ -695,27 +798,43 @@ class WorkerScheduler:
         self,
         assigned_session: AssignedSession,
         error_message: str,
+        *,
+        session_id: str | None = None,
     ) -> None:
         # Called only in self._create_new_sessions() to fail all of the queued SessionActions
         # if we experience an unrecoverable error during the setup phases of a new Session, but
         # before we've started the Session's actions running
         actions = assigned_session["sessionActions"]
-        now = datetime.now(tz=timezone.utc)
-        self._action_updates_map.update(
-            {
-                action["sessionActionId"]: SessionActionStatus(
-                    id=action["sessionActionId"],
-                    completed_status="FAILED" if action is actions[0] else "NEVER_ATTEMPTED",
-                    start_time=now if action is actions[0] else None,
-                    end_time=now if action is actions[0] else None,
-                    status=ActionStatus(
-                        state=ActionState.FAILED,
-                        fail_message=str(error_message),
-                    ),
-                )
-                for action in actions
-            }
+        worker_protocol_trace.emit(
+            TraceEvent.SESSION_FAIL, corr=session_id, action_count=len(actions)
         )
+        now = datetime.now(tz=timezone.utc)
+        statuses = {
+            action["sessionActionId"]: SessionActionStatus(
+                id=action["sessionActionId"],
+                completed_status="FAILED" if action is actions[0] else "NEVER_ATTEMPTED",
+                start_time=now if action is actions[0] else None,
+                end_time=now if action is actions[0] else None,
+                session_id=session_id,
+                kind=action.get("actionType"),
+                status=ActionStatus(
+                    state=ActionState.FAILED,
+                    fail_message=str(error_message),
+                ),
+            )
+            for action in actions
+        }
+        for action_status in statuses.values():
+            # These writes bypass _handle_session_action_update(), so announce
+            # the local terminal decision for each action here.
+            worker_protocol_trace.emit(
+                TraceEvent.ACTION_COMPLETE,
+                corr=action_status.id,
+                status=action_status.completed_status,
+                session_id=action_status.session_id,
+                kind=action_status.kind,
+            )
+        self._action_updates_map.update(statuses)
         self._wakeup.set()
 
     @staticmethod
@@ -850,7 +969,9 @@ class WorkerScheduler:
                     error_msg = (
                         f"Failed to create local session log directory on worker: {queue_log_dir}"
                     )
-                    self._fail_all_actions(session_spec, error_message=error_msg)
+                    self._fail_all_actions(
+                        session_spec, error_message=error_msg, session_id=new_session_id
+                    )
                     logger.error(
                         FilesystemLogEvent(
                             op=FilesystemLogEventOp.CREATE,
@@ -884,7 +1005,9 @@ class WorkerScheduler:
                     error_msg = (
                         f"Failed to create local session log file on worker: {session_log_file}"
                     )
-                    self._fail_all_actions(session_spec, error_message=error_msg)
+                    self._fail_all_actions(
+                        session_spec, error_message=error_msg, session_id=new_session_id
+                    )
                     logger.error(
                         FilesystemLogEvent(
                             op=FilesystemLogEventOp.CREATE,
@@ -912,7 +1035,9 @@ class WorkerScheduler:
                     session_log_file=session_log_file,
                 )
             except LogProvisioningError as log_provision_error:
-                self._fail_all_actions(session_spec, str(log_provision_error))
+                self._fail_all_actions(
+                    session_spec, str(log_provision_error), session_id=new_session_id
+                )
                 logger.error(
                     SessionLogEvent(
                         subtype=SessionLogEventSubtype.FAILED,
@@ -948,7 +1073,7 @@ class WorkerScheduler:
                     and job_details.job_run_as_user.is_worker_agent_user
                 ):
                     err_msg = "Job cannot run as WORKER_AGENT_USER. Worker Agent is running with Administrator privileges."
-                    self._fail_all_actions(session_spec, err_msg)
+                    self._fail_all_actions(session_spec, err_msg, session_id=new_session_id)
                     logger.error(
                         SessionLogEvent(
                             subtype=SessionLogEventSubtype.FAILED,
@@ -964,7 +1089,7 @@ class WorkerScheduler:
                 # Can't even start a session right now if we don't
                 # get valid job_details, so let's fail the actions
                 # in the same way as the log provisioning error
-                self._fail_all_actions(session_spec, str(error))
+                self._fail_all_actions(session_spec, str(error), session_id=new_session_id)
                 logger.error(
                     SessionLogEvent(
                         subtype=SessionLogEventSubtype.FAILED,
@@ -1015,7 +1140,7 @@ class WorkerScheduler:
                     )
                 except Exception as e:
                     message = f"Failed to resolve credentials for domain user '{_domain_settings.user}': {e}"
-                    self._fail_all_actions(session_spec, message)
+                    self._fail_all_actions(session_spec, message, session_id=new_session_id)
                     logger.error(
                         SessionLogEvent(
                             subtype=SessionLogEventSubtype.USER,
@@ -1038,7 +1163,7 @@ class WorkerScheduler:
                     )
                 except ValueError as e:
                     message = str(e)
-                    self._fail_all_actions(session_spec, message)
+                    self._fail_all_actions(session_spec, message, session_id=new_session_id)
                     logger.error(
                         SessionLogEvent(
                             subtype=SessionLogEventSubtype.USER,
@@ -1067,7 +1192,7 @@ class WorkerScheduler:
                 ) as e:
                     # Terminal error. We need to fail the Session.
                     message = "Error obtaining AWS Credentials for the Queue Role: %s" % str(e)
-                    self._fail_all_actions(session_spec, message)
+                    self._fail_all_actions(session_spec, message, session_id=new_session_id)
                     logger.error(
                         SessionLogEvent(
                             subtype=SessionLogEventSubtype.AWSCREDS,
@@ -1130,7 +1255,7 @@ class WorkerScheduler:
                     fail_message = "Job Attachments are configured on the Queue, but AWS Credentials for the Queue are not available."
                 else:
                     fail_message = "Misconfiguration. Job Attachments are configured on the Queue, but the Queue has no IAM Role."
-                self._fail_all_actions(session_spec, fail_message)
+                self._fail_all_actions(session_spec, fail_message, session_id=new_session_id)
                 logger.error(
                     SessionLogEvent(
                         subtype=SessionLogEventSubtype.FAILED,
@@ -1165,6 +1290,12 @@ class WorkerScheduler:
                     }
                 )
 
+            # Defense-in-depth: guarantee that the protocol trace settings are
+            # never part of the environment given to session action
+            # subprocesses. The variables are also removed from this process's
+            # environment at startup (see startup/entrypoint.py).
+            scrub_protocol_trace_env_vars(env)
+
             logger.debug("env = \n%s", json.dumps(env, indent=2))
 
             runtime_hint = (session_spec.get("metadata") or {}).get("runtimeHint")
@@ -1175,7 +1306,7 @@ class WorkerScheduler:
                 # service-side bug. Fail this session's actions visibly and
                 # continue; it must not take down the scheduler.
                 message = f"Failed to select session runtime: {e}"
-                self._fail_all_actions(session_spec, message)
+                self._fail_all_actions(session_spec, message, session_id=new_session_id)
                 logger.error(
                     SessionLogEvent(
                         subtype=SessionLogEventSubtype.FAILED,
@@ -1254,7 +1385,7 @@ class WorkerScheduler:
                 # and continue; do not take down the scheduler. Unexpected exception types
                 # still propagate.
                 message = f"Failed to create session: {e}"
-                self._fail_all_actions(session_spec, message)
+                self._fail_all_actions(session_spec, message, session_id=new_session_id)
                 logger.error(
                     SessionLogEvent(
                         subtype=SessionLogEventSubtype.FAILED,
@@ -1324,6 +1455,13 @@ class WorkerScheduler:
                 session=session,
                 job_entities=job_entities,
                 log_configuration=log_config,
+            )
+            worker_protocol_trace.emit(
+                TraceEvent.SESSION_START,
+                corr=new_session_id,
+                queue_id=queue_id,
+                job_id=job_id,
+                worker_id=self._worker_id,
             )
         return new_session_ids
 
@@ -1504,6 +1642,12 @@ class WorkerScheduler:
                         if not (update := self._action_updates_map.get(action_id, None))
                         or update.completed_status is None
                     ]
+                    for canceled_action_id in canceled_action_ids:
+                        worker_protocol_trace.emit(
+                            TraceEvent.ACTION_CANCEL,
+                            corr=canceled_action_id,
+                            session_id=session_id,
+                        )
                     session.cancel_actions(action_ids=canceled_action_ids)
 
                 # 2. update the queue actions
@@ -1524,6 +1668,7 @@ class WorkerScheduler:
                     self._return_sessionactions_from_stopped_session(
                         assigned_session_actions=assigned_session_actions,
                         failure_message=str(session_exception),
+                        session_id=session_id,
                     )
                     self._wakeup.set()
 
@@ -1534,6 +1679,7 @@ class WorkerScheduler:
             EnvironmentAction | TaskRunAction | AttachmentDownloadAction
         ],
         failure_message: str,
+        session_id: str | None = None,
     ) -> None:
         # The thread that normally runs session actions crashed or was stopped through a separate
         # failure flow (e.g. from an API response that said to stop it).
@@ -1624,18 +1770,30 @@ class WorkerScheduler:
                 # Note: NEVER_ATTEMPED must not be reported with a started/ended time.
                 completed_status = "NEVER_ATTEMPTED"
 
-            self._action_updates_map[action["sessionActionId"]] = SessionActionStatus(
+            action_status = SessionActionStatus(
                 id=session_action_id,
                 # FAILED for the first one in the list, NEVER_ATTEMPTED for all of the others.
                 completed_status=completed_status,
                 start_time=start_time,
                 end_time=end_time,
+                session_id=session_id,
+                kind=action.get("actionType"),
                 status=ActionStatus(
                     # The 'state' is ignored; we just need this for the fail message.
                     state=ActionState.FAILED,
                     fail_message=failure_message,
                 ),
             )
+            # This write bypasses _handle_session_action_update(), so announce
+            # the local terminal decision here.
+            worker_protocol_trace.emit(
+                TraceEvent.ACTION_COMPLETE,
+                corr=session_action_id,
+                status=completed_status,
+                session_id=session_id,
+                kind=action.get("actionType"),
+            )
+            self._action_updates_map[action["sessionActionId"]] = action_status
 
     def _update_session_logging(
         self,
@@ -1676,6 +1834,11 @@ class WorkerScheduler:
         """
         self._shutdown_fail_message = fail_message
         self._shutdown_grace = grace_time
+
+        worker_protocol_trace.emit(
+            TraceEvent.DRAIN_REQUESTED,
+            grace_seconds=grace_time.total_seconds() if grace_time is not None else None,
+        )
 
         # THIS ORDER IS IMPORTANT FOR DATA RACES
         # This is based on the logic in the main run() loop

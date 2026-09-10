@@ -58,6 +58,8 @@ from deadline.job_attachments.progress_tracker import ProgressReportMetadata
 
 from ..scheduler.session_action_status import SessionActionStatus
 from ..sessions.errors import SessionActionError
+from .. import worker_protocol_trace
+from ..worker_protocol_trace import TraceEvent
 from ..aws.deadline import record_runtime_failure_telemetry_event
 from ._extensions import session_extensions
 from .runtime._abc import SessionRuntimeCrashError
@@ -456,6 +458,8 @@ class Session:
                         start_time=current_action.start_time,
                         end_time=datetime.now(tz=timezone.utc),
                         id=current_action.definition.id,
+                        session_id=self.id,
+                        kind=current_action.definition.action_log_kind.value,
                         status=ActionStatus(
                             state=ActionState.CANCELED,
                             fail_message=self._stop_fail_message,
@@ -662,6 +666,8 @@ class Session:
                     start_time=datetime.now(tz=timezone.utc),
                     end_time=datetime.now(tz=timezone.utc),
                     id=e.action_id,
+                    session_id=self.id,
+                    kind=e.action_log_kind.value,
                     status=ActionStatus(
                         state=ActionState.FAILED,
                         fail_message=str(e),
@@ -703,6 +709,13 @@ class Session:
                 action_log_kind=action_definition.action_log_kind,
                 message="Action started.",
             )
+        )
+        worker_protocol_trace.emit(
+            TraceEvent.ACTION_START,
+            corr=action_definition.id,
+            session_id=self.id,
+            kind=action_definition.action_log_kind.value,
+            env_id=getattr(action_definition, "environment_id", None),
         )
 
         try:
@@ -753,6 +766,8 @@ class Session:
                     completed_status="FAILED",
                     start_time=now,
                     end_time=now,
+                    session_id=self.id,
+                    kind=action_definition.action_log_kind.value,
                     status=ActionStatus(
                         state=ActionState.FAILED,
                         fail_message=str(e),
@@ -790,6 +805,8 @@ class Session:
         self._report_action_update(
             SessionActionStatus(
                 id=current_action.definition.id,
+                session_id=self.id,
+                kind=current_action.definition.action_log_kind.value,
                 status=ActionStatus(
                     state=ActionState.FAILED,
                     fail_message=str(exception),
@@ -1214,6 +1231,8 @@ class Session:
             self._report_action_update(
                 SessionActionStatus(
                     id=current_action.definition.id,
+                    session_id=self.id,
+                    kind=current_action.definition.action_log_kind.value,
                     status=action_status,
                     start_time=current_action.start_time,
                     end_time=now if action_status.state != ActionState.RUNNING else None,

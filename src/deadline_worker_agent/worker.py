@@ -28,6 +28,8 @@ from .log_messages import AwsCredentialsLogEvent, AwsCredentialsLogEventOp
 from .metrics import HostMetricsLogger
 from .scheduler import WorkerScheduler
 from .sessions import Session
+from . import worker_protocol_trace
+from .worker_protocol_trace import TraceEvent
 
 
 logger = getLogger(__name__)
@@ -207,6 +209,14 @@ class Worker:
 
     def run(self) -> None:
         """Runs the main Worker loop for processing sessions."""
+        worker_protocol_trace.emit(TraceEvent.WORKER_START, worker_id=self._worker_id)
+        try:
+            self._run()
+        finally:
+            worker_protocol_trace.emit(TraceEvent.WORKER_STOP)
+
+    def _run(self) -> None:
+        """The implementation of the main Worker loop for processing sessions."""
 
         monitor_ec2_shutdown: Future[WorkerShutdown | None] | None = None
         with (

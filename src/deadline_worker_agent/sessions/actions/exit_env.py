@@ -41,6 +41,11 @@ class ExitEnvironmentAction(OpenjdAction):
         self._environment_id = environment_id
         self._details = details
 
+    @property
+    def environment_id(self) -> str:
+        """The unique identifier of the environment being exited"""
+        return self._environment_id
+
     def __eq__(self, other: Any) -> bool:
         return (
             type(self) is type(other)

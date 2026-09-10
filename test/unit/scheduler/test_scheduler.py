@@ -963,6 +963,7 @@ class TestCreateNewSessions:
         mock_fail_all_actions.assert_called_once_with(
             assigned_sessions[session_id],
             error_message=expected_error_msg,
+            session_id=session_id,
         )
 
     def test_log_provision_error(
