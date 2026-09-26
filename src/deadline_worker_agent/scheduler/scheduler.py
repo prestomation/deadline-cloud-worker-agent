@@ -48,6 +48,7 @@ from ..api_models import (
     AssignedSession,
     UpdateWorkerScheduleResponse,
     UpdatedSessionActionInfo,
+    SessionActionFailureReason,
     WorkerStatus,
     EnvironmentAction,
     TaskRunAction,
@@ -198,6 +199,7 @@ class WorkerScheduler:
     _job_run_as_user_override: JobsRunAsUserOverride
     _boto_session: BotoSession
     _worker_persistence_dir: Path
+    _emit_failure_reason: bool
     _worker_logs_dir: Path | None
     _retain_session_dir: bool
     _session_runtime_kind: SessionRuntimeKind
@@ -269,6 +271,16 @@ class WorkerScheduler:
         self._session_runtime_kind = session_runtime_kind
         self._windows_credentials_resolver: Optional[WindowsCredentialsResolver]
         self._session_root_dir = session_root_dir
+        # Structured session action failure reasons (ACTION_TIMEOUT) are sent
+        # only when the resolved Deadline service model declares the member.
+        # See DeadlineClient.supports_session_action_failure_reason.
+        self._emit_failure_reason = deadline.supports_session_action_failure_reason() is True
+        logger.info(
+            "Structured session action failure reasons (failureReason) are %s: the resolved "
+            "Deadline service model %s the UpdateWorkerSchedule member.",
+            "enabled" if self._emit_failure_reason else "disabled",
+            "declares" if self._emit_failure_reason else "does not declare",
+        )
 
         if os.name == "nt" and not (
             self._job_run_as_user_override.job_user or self._job_run_as_user_override.run_as_agent
@@ -476,6 +488,9 @@ class WorkerScheduler:
                     TraceEvent.ACTION_REPORT,
                     corr=action_id,
                     status=updated_action_info.get("completedStatus"),
+                    # The closed enum value exactly as sent on the wire; the
+                    # free-form progressMessage is never traced.
+                    failure_reason=updated_action_info.get("failureReason"),
                     progress=updated_action_info.get("progressPercent"),
                     session_id=report_session_ids.get(action_id),
                     has_timestamps=(
@@ -656,6 +671,9 @@ class WorkerScheduler:
             updated_action["completedStatus"] = action_updated.completed_status
         elif action_updated.update_time:
             updated_action["updatedAt"] = action_updated.update_time
+        failure_reason = self._session_action_failure_reason(action_updated)
+        if failure_reason is not None and self._emit_failure_reason:
+            updated_action["failureReason"] = failure_reason
         if action_updated.status:
             if action_updated.status.exit_code is not None:
                 updated_action["processExitCode"] = _exit_code_to_32bit_signed(
@@ -687,6 +705,27 @@ class WorkerScheduler:
             ]
 
         return updated_action
+
+    @staticmethod
+    def _session_action_failure_reason(
+        action_updated: SessionActionStatus,
+    ) -> SessionActionFailureReason | None:
+        """The structured failure reason for a terminal action report, if any.
+
+        ``ACTION_TIMEOUT`` is returned only when the report is ``FAILED`` and
+        the Open Job Description runtime reported ``ActionState.TIMEOUT``
+        (the action exceeded its runtime limit). Every other report,
+        including ordinary failures, has no reason. The diagnostic
+        ``TIMEOUT - ...`` progress message is kept independently; it is not
+        the source of this value.
+        """
+        if (
+            action_updated.completed_status == "FAILED"
+            and action_updated.status is not None
+            and action_updated.status.state == ActionState.TIMEOUT
+        ):
+            return "ACTION_TIMEOUT"
+        return None
 
     def _update_sessions(
         self,

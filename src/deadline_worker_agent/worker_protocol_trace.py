@@ -39,6 +39,13 @@ cheap no-op; when enabled, payloads are filtered against a per-event key
 allowlist, values are restricted to scalar types with a bounded string
 length, and (outside of strict mode) all emitter errors are swallowed. The
 emitter disables itself after repeated consecutive write failures.
+
+Payloads never carry customer content. In particular ``action.report``
+carries only closed protocol values: the ``completedStatus`` enum and, when
+the request carried one, the ``failureReason`` enum (``ACTION_TIMEOUT``).
+The free-form ``progressMessage`` is never traced. ``failure_reason`` is
+recorded exactly as sent on the wire, so a trace from a worker whose service
+model does not yet declare the member (or an older worker) simply omits it.
 """
 
 from __future__ import annotations
@@ -132,7 +139,7 @@ _EVENT_PAYLOAD_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
             )
         ),
         TraceEvent.ACTION_REPORT.value: frozenset(
-            ("status", "progress", "session_id", "has_timestamps")
+            ("status", "failure_reason", "progress", "session_id", "has_timestamps")
         ),
         TraceEvent.SESSION_START.value: frozenset(("queue_id", "job_id", "worker_id")),
         TraceEvent.SESSION_COMPLETE.value: frozenset(("queue_id", "job_id")),

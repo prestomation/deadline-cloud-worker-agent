@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING, Union
 from uuid import uuid4
 
 from boto3 import Session as _Session
@@ -42,6 +42,30 @@ class DeadlineClient:
 
     def __init__(self, real_client: Any):
         self._real_client = real_client
+
+    def supports_session_action_failure_reason(self) -> bool:
+        """Whether the resolved Deadline service model accepts
+        ``updatedSessionActions.*.failureReason`` on UpdateWorkerSchedule.
+
+        The worker may emit a structured session action failure reason (for
+        example ``ACTION_TIMEOUT``) ONLY when the public SDK model it runs with
+        declares the member: botocore validates request parameters against
+        the loaded model and rejects unknown members before any request is
+        sent, which would fail every UpdateWorkerSchedule call. The check is
+        therefore the release-ordering gate for the new field: publish the
+        service model first, and the worker starts emitting on its own once
+        it resolves that model. It is not a customer-facing setting.
+
+        Returns False for any client whose model cannot be inspected (for
+        example the test shim's mock values).
+        """
+        try:
+            service_model = self._real_client.meta.service_model
+            operation = service_model.operation_model("UpdateWorkerSchedule")
+            members = operation.input_shape.members["updatedSessionActions"].value.members
+        except Exception:
+            return False
+        return isinstance(members, Mapping) and "failureReason" in members
 
     def create_worker(
         self,

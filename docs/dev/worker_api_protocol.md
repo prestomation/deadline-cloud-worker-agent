@@ -111,7 +111,21 @@ Workflow before proceeding.
         BatchGetJobEntity API. Each manifest object includes `outputManifestPath` and `outputManifestHash` 
         properties indicating the location and hash of uploaded output manifest files. If a manifest had no 
         outputs, the list should still contain an empty object without path and hash properties.
-        5. Any other updates as dictated by a Worker-Initiated Drain workflow.
+        5. A `completedStatus` of `FAILED` for a Session Action whose Open Job Description action exceeded
+        its runtime limit (`timeout`). The Worker Agent enforces the limit locally, and its `progressMessage`
+        starts with `TIMEOUT` as a diagnostic for people reading logs; that text is not an authoritative
+        signal. When the Deadline service model that the Worker Agent resolves declares the optional
+        `failureReason` member of `updatedSessionActions`, the same report also carries the closed value
+        `failureReason: ACTION_TIMEOUT`. The Worker Agent sends `failureReason` only together with
+        `completedStatus: FAILED` and only for a runtime-limit timeout; ordinary failures and every other
+        status omit it.
+            * Release ordering is the gate: the public Deadline SDK model must be published before the
+            Worker Agent emits the member, because botocore validates request parameters against the
+            resolved model and rejects unknown members before sending any request. The Worker Agent
+            detects the member in the model at startup (`DeadlineClient.supports_session_action_failure_reason`)
+            and otherwise keeps sending the legacy shape. There is no command-line or configuration switch.
+            Service readers must accept reports without `failureReason` from older Worker Agents.
+        6. Any other updates as dictated by a Worker-Initiated Drain workflow.
     * Response: Success(200) cases:
         1. `assignedSessions` empty -> End any locally active Sessions that the worker is
         holding as active, and then loop.

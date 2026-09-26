@@ -740,6 +740,124 @@ class TestSchedulerSync:
             "outputManifestHash": "hash3",
         }
 
+    @pytest.mark.parametrize(
+        "state, completed_status, expected_reason",
+        [
+            pytest.param(ActionState.TIMEOUT, "FAILED", "ACTION_TIMEOUT", id="timeout"),
+            pytest.param(ActionState.FAILED, "FAILED", None, id="ordinary-failure"),
+            pytest.param(ActionState.CANCELED, "CANCELED", None, id="canceled"),
+            pytest.param(ActionState.SUCCESS, "SUCCEEDED", None, id="succeeded"),
+            pytest.param(ActionState.RUNNING, None, None, id="running-progress"),
+        ],
+    )
+    def test_updated_action_to_boto_failure_reason_when_supported(
+        self,
+        scheduler: WorkerScheduler,
+        state: ActionState,
+        completed_status: Optional[str],
+        expected_reason: Optional[str],
+    ) -> None:
+        """failureReason=ACTION_TIMEOUT is sent only for a FAILED report whose
+        OpenJD state is TIMEOUT; every other report omits the member. The
+        diagnostic TIMEOUT progress message is kept."""
+        # GIVEN the resolved service model declares the member
+        scheduler._emit_failure_reason = True
+        action_status = SessionActionStatus(
+            id="1234",
+            status=ActionStatus(
+                state=state,
+                exit_code=-1,
+                fail_message=(
+                    "TIMEOUT - Exceeded the allotted runtime limit."
+                    if state == ActionState.TIMEOUT
+                    else None
+                ),
+            ),
+            completed_status=completed_status,  # type: ignore[arg-type]
+        )
+
+        # WHEN
+        status_as_boto = scheduler._updated_action_to_boto(action_status)
+
+        # THEN
+        assert status_as_boto.get("failureReason") == expected_reason
+        if expected_reason is not None:
+            assert status_as_boto["completedStatus"] == "FAILED"
+            assert "TIMEOUT" in status_as_boto["progressMessage"]
+
+    def test_updated_action_to_boto_failure_reason_omitted_without_model_support(
+        self, scheduler: WorkerScheduler
+    ) -> None:
+        """Without the member in the resolved service model the worker keeps
+        the legacy report shape: FAILED plus the diagnostic message, and no
+        failureReason (botocore would reject an unknown member)."""
+        # GIVEN
+        scheduler._emit_failure_reason = False
+        action_status = SessionActionStatus(
+            id="1234",
+            status=ActionStatus(
+                state=ActionState.TIMEOUT,
+                exit_code=-1,
+                fail_message="TIMEOUT - Exceeded the allotted runtime limit.",
+            ),
+            completed_status="FAILED",
+        )
+
+        # WHEN
+        status_as_boto = scheduler._updated_action_to_boto(action_status)
+
+        # THEN
+        assert "failureReason" not in status_as_boto
+        assert status_as_boto["completedStatus"] == "FAILED"
+        assert "TIMEOUT" in status_as_boto["progressMessage"]
+
+    def test_failure_reason_never_pairs_with_non_failed_status(
+        self, scheduler: WorkerScheduler
+    ) -> None:
+        """A TIMEOUT state that (defensively) reaches the converter with a
+        non-FAILED completed status carries no reason: the reason is defined
+        only together with FAILED."""
+        scheduler._emit_failure_reason = True
+        action_status = SessionActionStatus(
+            id="1234",
+            status=ActionStatus(state=ActionState.TIMEOUT),
+            completed_status="CANCELED",
+        )
+
+        assert "failureReason" not in scheduler._updated_action_to_boto(action_status)
+
+    @pytest.mark.parametrize("supported", [True, False, MagicMock()])
+    def test_scheduler_gates_failure_reason_on_service_model(
+        self,
+        farm_id: str,
+        fleet_id: str,
+        worker_id: str,
+        job_run_as_user_overrides: JobsRunAsUserOverride,
+        boto_session: Mock,
+        worker_logs_dir: Path,
+        session_root_dir: Path,
+        supported: object,
+    ) -> None:
+        """The gate is the client's service-model capability; only an
+        explicit True enables emission."""
+        client = MagicMock()
+        client.supports_session_action_failure_reason.return_value = supported
+
+        scheduler = WorkerScheduler(
+            farm_id=farm_id,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+            deadline=client,
+            job_run_as_user_override=job_run_as_user_overrides,
+            boto_session=boto_session,
+            cleanup_session_user_processes=True,
+            worker_persistence_dir=Path("/var/lib/deadline"),
+            worker_logs_dir=worker_logs_dir,
+            session_root_dir=session_root_dir,
+        )
+
+        assert scheduler._emit_failure_reason is (supported is True)
+
 
 class TestCreateNewSessions:
     """Tests for WorkerScheduler._create_new_sessions"""

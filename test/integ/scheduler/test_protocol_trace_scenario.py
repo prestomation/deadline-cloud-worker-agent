@@ -113,12 +113,17 @@ class FakeService:
     repeat until the terminal report arrives.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, cancel_tasks_after_env_enter: bool = True) -> None:
         self.reports: dict[str, str] = {}
+        #: Every UpdatedSessionActionInfo that carried a completedStatus,
+        #: exactly as the worker sent it (the wire view of each terminal
+        #: report, keyed by action id).
+        self.terminal_requests: dict[str, dict[str, Any]] = {}
         self.updates_seen: set[str] = set()
         self.delivered_env_exit = False
         self.session_removed = threading.Event()
         self.lock = threading.Lock()
+        self._cancel_tasks_after_env_enter = cancel_tasks_after_env_enter
 
     def update_worker_schedule(self, *, updated_session_actions=None, **kwargs) -> dict[str, Any]:
         with self.lock:
@@ -126,6 +131,7 @@ class FakeService:
                 self.updates_seen.add(action_id)
                 if completed := info.get("completedStatus"):
                     self.reports[action_id] = completed
+                    self.terminal_requests[action_id] = dict(info)
 
             cancel_ids: list[str] = []
             pipeline: list[dict[str, Any]] = _session_actions_initial()
@@ -143,7 +149,7 @@ class FakeService:
                 # deliver the environment exit.
                 self.delivered_env_exit = True
                 pipeline.append(_session_action_env_exit())
-            elif ACTION_ENV_ENTER in self.reports:
+            elif ACTION_ENV_ENTER in self.reports and self._cancel_tasks_after_env_enter:
                 # Phase 1: envEnter succeeded (task-1 is running/sleeping and
                 # task-2 is queued); cancel BOTH tasks. The agent cancels the
                 # RUNNING action immediately and settles the queued one
@@ -174,7 +180,14 @@ class FakeService:
             }
 
 
-def _entity_response(identifier: dict[str, Any]) -> dict[str, Any]:
+# Long enough that task-1 is still running when its cancel (or its runtime
+# limit) arrives.
+SLEEP_ON_RUN: dict[str, Any] = {"command": "/bin/sleep", "args": ["120"]}
+
+
+def _entity_response(
+    identifier: dict[str, Any], *, on_run: dict[str, Any] = SLEEP_ON_RUN
+) -> dict[str, Any]:
     """Serves BatchGetJobEntity requests for the scenario's job."""
     if "jobDetails" in identifier:
         return {
@@ -211,9 +224,7 @@ def _entity_response(identifier: dict[str, Any]) -> dict[str, Any]:
                     "name": "ScenarioStep",
                     "script": {
                         "actions": {
-                            # Long enough that task-1 is still running when its
-                            # cancel arrives; the cancel terminates it.
-                            "onRun": {"command": "/bin/sleep", "args": ["120"]},
+                            "onRun": on_run,
                         }
                     },
                 },
@@ -246,6 +257,97 @@ def _read_trace(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _run_scenario(
+    *,
+    service: FakeService,
+    trace_file: Path,
+    tmp_path: Path,
+    on_run: dict[str, Any] = SLEEP_ON_RUN,
+    service_model_supports_failure_reason: bool = False,
+) -> list[dict[str, Any]]:
+    """Runs the REAL worker loop against ``service`` and returns the trace.
+
+    ``service_model_supports_failure_reason`` stands in for the resolved
+    Deadline service model declaring ``failureReason`` (the release-ordering
+    gate; see DeadlineClient.supports_session_action_failure_reason).
+    """
+    deadline_client = MagicMock()
+    deadline_client.supports_session_action_failure_reason.return_value = (
+        service_model_supports_failure_reason
+    )
+
+    # JobEntities introspects the boto service model for the max batch size.
+    identifiers_field = MagicMock()
+    identifiers_field.metadata = {"max": 5}
+    operation_model = MagicMock()
+    operation_model.input_shape.members = {"identifiers": identifiers_field}
+    deadline_client._real_client._service_model.operation_model.return_value = operation_model
+
+    def fake_batch_get_job_entity(*, identifiers, **kwargs) -> dict[str, Any]:
+        return {
+            "entities": [_entity_response(identifier, on_run=on_run) for identifier in identifiers],
+            "errors": [],
+        }
+
+    deadline_client.batch_get_job_entity.side_effect = fake_batch_get_job_entity
+
+    boto_session = MagicMock()
+    boto_session.region_name = "us-west-2"
+    boto_session.client.return_value.put_log_events.return_value = {
+        "nextSequenceToken": "token-1",
+    }
+
+    session_root_dir = tmp_path / "sessions"
+    session_root_dir.mkdir(parents=True, exist_ok=True)
+    persistence_dir = tmp_path / "persistence"
+    persistence_dir.mkdir(parents=True, exist_ok=True)
+
+    scheduler = WorkerScheduler(
+        deadline=deadline_client,
+        farm_id=FARM_ID,
+        fleet_id=FLEET_ID,
+        worker_id=WORKER_ID,
+        job_run_as_user_override=JobsRunAsUserOverride(run_as_agent=True),
+        boto_session=boto_session,
+        cleanup_session_user_processes=False,
+        worker_persistence_dir=persistence_dir,
+        worker_logs_dir=None,
+        retain_session_dir=False,
+        session_root_dir=session_root_dir,
+    )
+    assert scheduler._emit_failure_reason is service_model_supports_failure_reason
+
+    worker = MagicMock(spec=Worker)
+    worker._worker_id = WORKER_ID
+    worker._run = scheduler.run
+
+    def stop_when_session_removed() -> None:
+        # Drain the worker once the service has taken the session back.
+        assert service.session_removed.wait(timeout=120), "session never removed"
+        scheduler.shutdown(fail_message="scenario complete")
+
+    stopper = threading.Thread(target=stop_when_session_removed, daemon=True)
+
+    # WHEN the real worker loop runs the scenario end to end
+    with (
+        patch(
+            "deadline_worker_agent.scheduler.scheduler.update_worker_schedule",
+            side_effect=lambda **kw: service.update_worker_schedule(
+                updated_session_actions=kw.get("updated_session_actions")
+            ),
+        ),
+        patch(
+            "deadline_worker_agent.scheduler.scheduler.update_worker",
+            return_value={},
+        ),
+    ):
+        stopper.start()
+        Worker.run(worker)  # the real hook: emits worker.start/worker.stop
+        stopper.join(timeout=10)
+
+    return _read_trace(trace_file)
+
+
 class TestProtocolTraceScenario:
     def test_multi_action_session_with_cancels_produces_protocol_trace(
         self, trace_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -254,78 +356,9 @@ class TestProtocolTraceScenario:
         monkeypatch.setenv("DEADLINE_CLOUD_TELEMETRY_OPT_OUT", "true")
         service = FakeService()
 
-        deadline_client = MagicMock()
-
-        # JobEntities introspects the boto service model for the max batch size.
-        identifiers_field = MagicMock()
-        identifiers_field.metadata = {"max": 5}
-        operation_model = MagicMock()
-        operation_model.input_shape.members = {"identifiers": identifiers_field}
-        deadline_client._real_client._service_model.operation_model.return_value = operation_model
-
-        def fake_batch_get_job_entity(*, identifiers, **kwargs) -> dict[str, Any]:
-            return {
-                "entities": [_entity_response(identifier) for identifier in identifiers],
-                "errors": [],
-            }
-
-        deadline_client.batch_get_job_entity.side_effect = fake_batch_get_job_entity
-
-        boto_session = MagicMock()
-        boto_session.region_name = "us-west-2"
-        boto_session.client.return_value.put_log_events.return_value = {
-            "nextSequenceToken": "token-1",
-        }
-
-        session_root_dir = tmp_path / "sessions"
-        session_root_dir.mkdir(parents=True, exist_ok=True)
-        persistence_dir = tmp_path / "persistence"
-        persistence_dir.mkdir(parents=True, exist_ok=True)
-
-        scheduler = WorkerScheduler(
-            deadline=deadline_client,
-            farm_id=FARM_ID,
-            fleet_id=FLEET_ID,
-            worker_id=WORKER_ID,
-            job_run_as_user_override=JobsRunAsUserOverride(run_as_agent=True),
-            boto_session=boto_session,
-            cleanup_session_user_processes=False,
-            worker_persistence_dir=persistence_dir,
-            worker_logs_dir=None,
-            retain_session_dir=False,
-            session_root_dir=session_root_dir,
-        )
-
-        worker = MagicMock(spec=Worker)
-        worker._worker_id = WORKER_ID
-        worker._run = scheduler.run
-
-        def stop_when_session_removed() -> None:
-            # Drain the worker once the service has taken the session back.
-            assert service.session_removed.wait(timeout=120), "session never removed"
-            scheduler.shutdown(fail_message="scenario complete")
-
-        stopper = threading.Thread(target=stop_when_session_removed, daemon=True)
-
-        # WHEN the real worker loop runs the scenario end to end
-        with (
-            patch(
-                "deadline_worker_agent.scheduler.scheduler.update_worker_schedule",
-                side_effect=lambda **kw: service.update_worker_schedule(
-                    updated_session_actions=kw.get("updated_session_actions")
-                ),
-            ),
-            patch(
-                "deadline_worker_agent.scheduler.scheduler.update_worker",
-                return_value={},
-            ),
-        ):
-            stopper.start()
-            Worker.run(worker)  # the real hook: emits worker.start/worker.stop
-            stopper.join(timeout=10)
+        records = _run_scenario(service=service, trace_file=trace_file, tmp_path=tmp_path)
 
         # THEN the agent produced a complete protocol history
-        records = _read_trace(trace_file)
         events = [(r["event"], r["corr"]) for r in records]
 
         def index_of(event: str, corr: str | None) -> int:
@@ -402,6 +435,102 @@ class TestProtocolTraceScenario:
 
         # Export the capture for external tooling (PObserve replay).
         if out := os.environ.get("DEADLINE_WORKER_PROTOCOL_TRACE_SCENARIO_OUT"):
+            out_path = Path(out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(trace_file, out_path)
+
+    @pytest.mark.parametrize(
+        "service_model_supports_failure_reason",
+        [
+            pytest.param(True, id="model-declares-failureReason"),
+            pytest.param(False, id="model-without-failureReason"),
+        ],
+    )
+    def test_action_timeout_reports_failed_with_structured_reason(
+        self,
+        trace_file: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        service_model_supports_failure_reason: bool,
+    ) -> None:
+        """An Open Job Description runtime limit (``timeout``) on task-1:
+
+        * the worker enforces the timeout locally (task-1 ends near 1 s);
+        * task-1 is reported ``FAILED`` with the diagnostic ``TIMEOUT`` message;
+        * ``failureReason: ACTION_TIMEOUT`` is sent, and traced, exactly when
+          the resolved service model declares the member;
+        * the failure cascades: task-2 is ``NEVER_ATTEMPTED`` and never
+          starts, while the envExit still runs;
+        * task-1 has exactly one terminal report.
+        """
+        monkeypatch.setenv("DEADLINE_CLOUD_TELEMETRY_OPT_OUT", "true")
+        # No service cancels: the runtime limit alone ends task-1.
+        service = FakeService(cancel_tasks_after_env_enter=False)
+
+        records = _run_scenario(
+            service=service,
+            trace_file=trace_file,
+            tmp_path=tmp_path,
+            on_run={"command": "/bin/sleep", "args": ["120"], "timeout": 1},
+            service_model_supports_failure_reason=service_model_supports_failure_reason,
+        )
+        events = [(r["event"], r["corr"]) for r in records]
+
+        def index_of(event: str, corr: str | None) -> int:
+            assert (event, corr) in events, f"missing {event} {corr}: {events}"
+            return events.index((event, corr))
+
+        # The wire: FAILED + diagnostic message always; the structured reason
+        # only when the model accepts it. Ordinary reports carry no reason.
+        task1_request = service.terminal_requests[ACTION_TASK_1]
+        assert task1_request["completedStatus"] == "FAILED"
+        assert "TIMEOUT" in task1_request["progressMessage"]
+        if service_model_supports_failure_reason:
+            assert task1_request["failureReason"] == "ACTION_TIMEOUT"
+        else:
+            assert "failureReason" not in task1_request
+        for action_id, request in service.terminal_requests.items():
+            if action_id != ACTION_TASK_1:
+                assert "failureReason" not in request, action_id
+        assert service.reports[ACTION_ENV_ENTER] == "SUCCEEDED"
+        assert service.reports[ACTION_TASK_2] == "NEVER_ATTEMPTED"
+        assert service.reports[ACTION_ENV_EXIT] == "SUCCEEDED"
+
+        # The trace: the reason follows task-1's start and pairs with FAILED.
+        task1_start = index_of("action.start", ACTION_TASK_1)
+        task1_settle = records[index_of("action.complete", ACTION_TASK_1)]
+        assert task1_settle["payload"]["status"] == "FAILED"
+        task1_reports = [
+            r
+            for r in records
+            if r["event"] == "action.report"
+            and r["corr"] == ACTION_TASK_1
+            and r["payload"]["status"]
+        ]
+        assert len(task1_reports) == 1, task1_reports
+        (task1_report,) = task1_reports
+        assert records.index(task1_report) > task1_start
+        assert task1_report["payload"]["status"] == "FAILED"
+        assert task1_report["payload"]["has_timestamps"] is True
+        expected_reason = "ACTION_TIMEOUT" if service_model_supports_failure_reason else None
+        assert task1_report["payload"]["failure_reason"] == expected_reason
+        # The free-form message never reaches the trace.
+        assert "Exceeded the allotted runtime limit" not in json.dumps(task1_report["payload"])
+
+        # No later non-exit action runs; envExit still does.
+        assert ("action.start", ACTION_TASK_2) not in events
+        task2_settle = records[index_of("action.complete", ACTION_TASK_2)]
+        assert task2_settle["payload"]["status"] == "NEVER_ATTEMPTED"
+        assert index_of("action.start", ACTION_ENV_EXIT) > records.index(task1_settle)
+        assert records[index_of("action.complete", ACTION_ENV_EXIT)]["payload"]["status"] == (
+            "SUCCEEDED"
+        )
+        for r in records:
+            if r["event"] == "action.report" and r["corr"] != ACTION_TASK_1:
+                assert r["payload"].get("failure_reason") is None, r
+
+        # Export the capture for external tooling (PObserve replay).
+        if out := os.environ.get("DEADLINE_WORKER_PROTOCOL_TRACE_TIMEOUT_SCENARIO_OUT"):
             out_path = Path(out)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(trace_file, out_path)

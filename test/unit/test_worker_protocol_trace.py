@@ -606,6 +606,82 @@ class TestSchedulerHooks:
             "worker_id": "worker-123",
         }
 
+    @pytest.mark.parametrize(
+        "emit_failure_reason, state, expected_reason",
+        [
+            pytest.param(True, ActionState.TIMEOUT, "ACTION_TIMEOUT", id="timeout-supported"),
+            pytest.param(False, ActionState.TIMEOUT, None, id="timeout-unsupported-model"),
+            pytest.param(True, ActionState.FAILED, None, id="ordinary-failure"),
+        ],
+    )
+    def test_sync_action_report_carries_wire_failure_reason_only(
+        self,
+        trace: WorkerProtocolTrace,
+        stream: io.StringIO,
+        emit_failure_reason: bool,
+        state: ActionState,
+        expected_reason: str | None,
+    ) -> None:
+        """action.report traces the closed failureReason exactly as sent on
+        the wire (present only when the service model accepts it and the
+        action timed out) and never the free-form progressMessage."""
+        # GIVEN a scheduler with one FAILED report pending
+        scheduler = MagicMock(spec=WorkerScheduler)
+        scheduler._emit_failure_reason = emit_failure_reason
+        scheduler._action_update_lock = RLock()
+        scheduler._action_updates_map = {
+            "sessionaction-1": SessionActionStatus(
+                id="sessionaction-1",
+                session_id="session-1",
+                kind="TaskRun",
+                status=ActionStatus(
+                    state=state,
+                    exit_code=-1,
+                    fail_message="TIMEOUT - Exceeded the allotted runtime limit.",
+                ),
+                completed_status="FAILED",
+            )
+        }
+        scheduler._updated_session_actions = (  # type: ignore[method-assign]
+            lambda: WorkerScheduler._updated_session_actions(cast(WorkerScheduler, scheduler))
+        )
+        scheduler._updated_action_to_boto = (  # type: ignore[method-assign]
+            lambda action: WorkerScheduler._updated_action_to_boto(
+                cast(WorkerScheduler, scheduler), action
+            )
+        )
+        scheduler._session_action_failure_reason = WorkerScheduler._session_action_failure_reason
+        scheduler._deadline = MagicMock()
+        scheduler._farm_id = "farm-1"
+        scheduler._fleet_id = "fleet-1"
+        scheduler._worker_id = "worker-1"
+        scheduler._shutdown = Event()
+        sent: dict[str, Any] = {}
+
+        def fake_uws(**kwargs: Any) -> dict[str, Any]:
+            sent.update(kwargs["updated_session_actions"])
+            return {"assignedSessions": {}, "cancelSessionActions": {}, "updateIntervalSeconds": 5}
+
+        # WHEN
+        with pytest.MonkeyPatch.context() as mp:
+            import deadline_worker_agent.scheduler.scheduler as scheduler_mod
+
+            mp.setattr(scheduler_mod, "update_worker_schedule", fake_uws)
+            WorkerScheduler._sync(cast(WorkerScheduler, scheduler), interruptable=True)
+
+        # THEN the wire and the trace agree
+        assert sent["sessionaction-1"].get("failureReason") == expected_reason
+        assert "TIMEOUT" in sent["sessionaction-1"]["progressMessage"]
+        (report,) = [r for r in _records(stream) if r["event"] == "action.report"]
+        assert report["corr"] == "sessionaction-1"
+        assert report["payload"]["status"] == "FAILED"
+        assert report["payload"]["failure_reason"] == expected_reason
+        assert report["payload"]["session_id"] == "session-1"
+        # Never the free-form message.
+        assert "progress_message" not in report["payload"]
+        assert "Exceeded the allotted runtime limit" not in json.dumps(report["payload"])
+        assert set(report["payload"]) <= trace_mod._EVENT_PAYLOAD_KEYS["action.report"]
+
     def test_trace_new_assignments_noop_when_disabled(self, stream: io.StringIO) -> None:
         # GIVEN a disabled trace
         previous = set_trace(WorkerProtocolTrace(enabled=False, stream=stream, strict=True))

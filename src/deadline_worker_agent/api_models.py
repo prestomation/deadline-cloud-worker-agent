@@ -34,6 +34,8 @@ __all__ = [
     "StepDetailsData",
     "StepDetailsError",
     "StepDetailsIdentifier",
+    "CompletedActionStatus",
+    "SessionActionFailureReason",
     "StringParameter",
     "BoolParameter",
     "BoolListParameter",
@@ -56,6 +58,11 @@ StepActionType = Literal["TASK_RUN"]  # noqa
 AttachmentDownloadActionType = Literal["SYNC_INPUT_JOB_ATTACHMENTS"]  # noqa
 AttachmentUploadActionType = Literal["SYNC_OUTPUT_JOB_ATTACHMENTS"]  # noqa
 CompletedActionStatus = Literal["SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELED", "NEVER_ATTEMPTED"]
+# The closed set of structured reasons a worker may attach to a FAILED session
+# action report. ACTION_TIMEOUT means the action exceeded its Open Job
+# Description runtime limit (openjd ActionState.TIMEOUT). A worker never sends
+# a reason with any other completedStatus, and ordinary failures carry none.
+SessionActionFailureReason = Literal["ACTION_TIMEOUT"]
 
 
 class EnvironmentAction(TypedDict):
@@ -492,6 +499,11 @@ class ManifestInfo(TypedDict):
 
 class UpdatedSessionActionInfo(TypedDict):
     completedStatus: NotRequired[CompletedActionStatus]
+    # Only ever present together with completedStatus == "FAILED". The worker
+    # sends it only when the resolved Deadline service model declares the
+    # member (see DeadlineClient.supports_session_action_failure_reason);
+    # botocore parameter validation rejects unknown request members.
+    failureReason: NotRequired[SessionActionFailureReason]
     processExitCode: NotRequired[int]
     progressMessage: NotRequired[str]
     startedAt: NotRequired[datetime]
