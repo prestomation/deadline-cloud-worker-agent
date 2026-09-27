@@ -170,7 +170,7 @@ class WorkerSettings(BaseSettings):
             "retain_session_dir": {"env": "DEADLINE_WORKER_RETAIN_SESSION_DIR"},
             "structured_logs": {"env": "DEADLINE_WORKER_STRUCTURED_LOGS"},
             "telemetry_opt_out": {"env": "DEADLINE_CLOUD_TELEMETRY_OPT_OUT"},
-            "session_dir_root": {"env": "DEADLINE_WORKER_SESSION_ROOT_DIR"},
+            "session_root_dir": {"env": "DEADLINE_WORKER_SESSION_ROOT_DIR"},
         }
 
         @classmethod

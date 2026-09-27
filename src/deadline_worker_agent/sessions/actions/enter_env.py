@@ -52,6 +52,11 @@ class EnterEnvironmentAction(OpenjdAction):
         self._step_name = step_name
         self._step_let_declarations = step_let_declarations
 
+    @property
+    def environment_id(self) -> str:
+        """The unique identifier of the environment being entered"""
+        return self._job_env_id
+
     def __eq__(self, other: Any) -> bool:
         return (
             type(self) is type(other)

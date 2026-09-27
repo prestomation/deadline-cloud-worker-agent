@@ -20,3 +20,10 @@ class SessionActionStatus:
     end_time: datetime | None = None
     completed_status: CompletedActionStatus | None = None
     manifests: list[ManifestInfo] | None = None
+    session_id: str | None = None
+    """The ID of the session the action belongs to. Diagnostic metadata for
+    the protocol trace; never sent to the service."""
+    kind: str | None = None
+    """The action kind (a SessionActionLogKind value or an API actionType
+    value). Diagnostic metadata for the protocol trace; never sent to the
+    service."""

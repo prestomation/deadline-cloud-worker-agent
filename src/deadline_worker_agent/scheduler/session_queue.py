@@ -240,6 +240,8 @@ class SessionActionQueue:
                 completed_status=cancel_outcome,
                 start_time=timestamp,
                 end_time=timestamp,
+                session_id=self._session_id,
+                kind=action.definition["actionType"],
                 # TODO: This is semantically incorrect, but status.state is a required field. We
                 # only need this to communicate the message. In the future, we may want to remove
                 # the "status" field from Open Job Description here and hoist the fields we care about up to the
